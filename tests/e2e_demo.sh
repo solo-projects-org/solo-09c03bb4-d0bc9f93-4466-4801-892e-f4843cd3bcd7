@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端自测：源站 + 两个采集实例（真实 HTTP，模拟 docker compose 拓扑）。
-# 覆盖：建任务 -> 断流续传 -> 半件拒发 -> 换版供旧 -> 并发 409 -> 崩溃恢复 -> 忽略 Range 重取。
+# 覆盖：建任务 -> 断流续传 -> 半件拒发 -> 换版供旧 -> 并发 409 -> 崩溃恢复 -> 忽略 Range 重取
+#       -> 相似站号发布隔离 -> 旧卷串件离线修复 -> 不可恢复拒绝下载。
 set -euo pipefail
 
 PY="${PYTHON:-/tmp/venv/bin/python}"
@@ -32,6 +33,16 @@ wait_health() {
 
 # 从 stdin 的 JSON 中取字段：echo "$json" | jp "d['id']"
 jp() { "$PY" -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
+
+# 下载并校验：响应 X-SHA256 必须与正文实际摘要一致（正文与响应摘要一致的硬校验）
+check_sha_header() {
+  local url="$1" out="$2"
+  curl -sf -D "$RUN/dl.h" "$url" -o "$out"
+  local hdr actual
+  hdr=$(grep -i '^x-sha256' "$RUN/dl.h" | tr -d '\r' | awk '{print $2}')
+  actual=$(sha256sum "$out" | awk '{print $1}')
+  test "$hdr" = "$actual"
+}
 
 start_source() {
   cd "$ROOT"
@@ -188,5 +199,79 @@ echo "$DETAIL" | "$PY" -c "import sys,json;d=json.load(sys.stdin);assert d['stat
 curl -sf "http://127.0.0.1:$PORT_A/tasks/$TID2/download" -o "$RUN/st02.csv"
 curl -sf "http://127.0.0.1:$PORT_SOURCE/data/ST02/2026-11-16" -o "$RUN/source-st02.csv"
 cmp "$RUN/st02.csv" "$RUN/source-st02.csv" && echo "ST02 原件一致 OK"
+
+echo; echo "== 9. 站号隔离：ST.01 与 ST_01 同日同修订发布互不串件 =="
+curl -sf -X POST "http://127.0.0.1:$PORT_SOURCE/admin/station" -H 'Content-Type: application/json' \
+  -d '{"station":"ST.01","date":"2026-11-16"}' >/dev/null
+curl -sf -X POST "http://127.0.0.1:$PORT_SOURCE/admin/station" -H 'Content-Type: application/json' \
+  -d '{"station":"ST_01","date":"2026-11-16"}' >/dev/null
+TIDA=$(curl -sf -X POST "http://127.0.0.1:$PORT_A/tasks" -H 'Content-Type: application/json' \
+  -d '{"station":"ST.01","date":"2026-11-16"}' | jp "d['id']")
+TIDB=$(curl -sf -X POST "http://127.0.0.1:$PORT_B/tasks" -H 'Content-Type: application/json' \
+  -d '{"station":"ST_01","date":"2026-11-16"}' | jp "d['id']")
+echo "ST.01 task=$TIDA（实例A）  ST_01 task=$TIDB（实例B）"
+curl -sf -X POST "http://127.0.0.1:$PORT_A/tasks/$TIDA/resume" >/dev/null
+curl -sf -X POST "http://127.0.0.1:$PORT_B/tasks/$TIDB/resume" >/dev/null
+check_sha_header "http://127.0.0.1:$PORT_A/tasks/$TIDA/download" "$RUN/st-dot.csv"
+check_sha_header "http://127.0.0.1:$PORT_B/tasks/$TIDB/download" "$RUN/st-und.csv"
+curl -sf "http://127.0.0.1:$PORT_SOURCE/data/ST.01/2026-11-16" -o "$RUN/source-st-dot.csv"
+curl -sf "http://127.0.0.1:$PORT_SOURCE/data/ST_01/2026-11-16" -o "$RUN/source-st-und.csv"
+cmp "$RUN/st-dot.csv" "$RUN/source-st-dot.csv" && echo "ST.01 原件与源站一致、摘要与正文一致 OK"
+cmp "$RUN/st-und.csv" "$RUN/source-st-und.csv" && echo "ST_01 原件与源站一致、摘要与正文一致 OK"
+if cmp -s "$RUN/st-dot.csv" "$RUN/st-und.csv"; then
+  echo "两站内容不应相同（串件！）" >&2; exit 1
+fi
+echo "两站发布件互不串件 OK"
+
+echo; echo "== 10. 旧卷串件：源站离线时 resume 用留存分片恢复原发布件 =="
+# 构造旧卷现场：两任务发布登记指向旧式顶层共享路径，内容为后发布者 ST_01
+LEGACY="$SHARED/published/ST_01_2026-11-16_r1.csv"
+cp "$RUN/source-st-und.csv" "$LEGACY"
+"$PY" - "$SHARED/collector.db" "$LEGACY" "$TIDA" "$TIDB" <<'PYEOF'
+import sqlite3, sys
+db, legacy, ta, tb = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+conn = sqlite3.connect(db)
+conn.execute("UPDATE publishes SET file_path=? WHERE task_id IN (?,?)", (legacy, ta, tb))
+conn.commit(); conn.close()
+print("已构造旧卷串件现场：两任务发布登记指向同一旧路径")
+PYEOF
+# 修复前：串件方（ST.01）下载必须被拒绝（共享路径内容核对不通过）
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_A/tasks/$TIDA/download")
+echo "修复前下载串件任务 HTTP=$CODE（期望 409）"; test "$CODE" = "409"
+# 健康旧件（ST_01）仍可下载，正文与摘要一致
+check_sha_header "http://127.0.0.1:$PORT_B/tasks/$TIDB/download" "$RUN/healthy.csv"
+cmp "$RUN/healthy.csv" "$RUN/source-st-und.csv" && echo "健康旧件下载一致 OK"
+# 源站离线
+kill "$SRC_PID"; wait "$SRC_PID" 2>/dev/null || true; SRC_PID=""
+echo "源站已离线"
+CODE=$(curl -s -o "$RUN/offline-resume.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT_A/tasks/$TIDA/resume")
+echo "源站离线 resume HTTP=$CODE（期望 503；本地修复已在网络请求前完成）"; test "$CODE" = "503"
+# 修复后：ST.01 下载必须恢复原登记内容（长度与 SHA-256 符合原登记）
+check_sha_header "http://127.0.0.1:$PORT_A/tasks/$TIDA/download" "$RUN/restored.csv"
+cmp "$RUN/restored.csv" "$RUN/source-st-dot.csv" && echo "离线恢复原发布件 OK（长度与 SHA-256 符合原登记）"
+# 健康旧件仍未受修复影响
+check_sha_header "http://127.0.0.1:$PORT_B/tasks/$TIDB/download" "$RUN/healthy2.csv"
+cmp "$RUN/healthy2.csv" "$RUN/source-st-und.csv" && echo "修复未损坏其他任务原件 OK"
+
+echo; echo "== 11. 无法恢复：标为不可用并拒绝下载 =="
+# 对 TIDB 制造串件（垃圾内容）且删除其留存分片 -> 不可恢复
+LEGACY2="$SHARED/published/ST_01_2026-11-16_r1_garbage.csv"
+head -c 12345 /dev/urandom > "$LEGACY2"
+"$PY" - "$SHARED/collector.db" "$LEGACY2" "$TIDB" <<'PYEOF'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("UPDATE publishes SET file_path=? WHERE task_id=?", (sys.argv[2], int(sys.argv[3])))
+conn.commit(); conn.close()
+PYEOF
+rm -f "$SHARED/parts/$TIDB/r1.part"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT_B/tasks/$TIDB/resume")
+echo "离线 resume（不可恢复）HTTP=$CODE（期望 503）"; test "$CODE" = "503"
+AVAIL=$(curl -sf "http://127.0.0.1:$PORT_B/tasks/$TIDB" | jp "d['latest_published']['available']")
+echo "ST_01 发布可用标记=$AVAIL（期望 False）"; test "$AVAIL" = "False"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_B/tasks/$TIDB/download")
+echo "不可用原件下载 HTTP=$CODE（期望 409）"; test "$CODE" = "409"
+# ST.01 的已恢复原件不受其他任务修复影响
+check_sha_header "http://127.0.0.1:$PORT_A/tasks/$TIDA/download" "$RUN/still-ok.csv"
+cmp "$RUN/still-ok.csv" "$RUN/source-st-dot.csv" && echo "其他任务修复未串件 OK"
 
 echo; echo "全部端到端检查通过 ✔  运行目录：$RUN"

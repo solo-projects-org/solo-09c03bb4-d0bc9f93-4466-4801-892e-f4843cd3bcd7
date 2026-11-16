@@ -94,10 +94,33 @@ class Database:
                     sha256 TEXT NOT NULL,
                     size INTEGER NOT NULL,
                     published_at TEXT NOT NULL,
+                    available INTEGER NOT NULL DEFAULT 1,
+                    unavailable_reason TEXT,
+                    repaired_at TEXT,
                     UNIQUE(task_id, revision)
                 );
                 """
             )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """旧数据卷就地迁移：为 publishes 补可用性/修复列（不搬动任何文件）。"""
+        cols = {
+            row[1] for row in self._conn().execute("PRAGMA table_info(publishes)")
+        }
+        with self._conn():
+            if "available" not in cols:
+                self._conn().execute(
+                    "ALTER TABLE publishes ADD COLUMN available INTEGER NOT NULL DEFAULT 1"
+                )
+            if "unavailable_reason" not in cols:
+                self._conn().execute(
+                    "ALTER TABLE publishes ADD COLUMN unavailable_reason TEXT"
+                )
+            if "repaired_at" not in cols:
+                self._conn().execute(
+                    "ALTER TABLE publishes ADD COLUMN repaired_at TEXT"
+                )
 
     # ---------- 启动恢复 ----------
     def recover_on_startup(self) -> None:
@@ -302,6 +325,39 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
+    # ---------- 发布件修复（旧卷串件/缺失恢复） ----------
+    def list_publishes(self, task_id: int) -> list[dict[str, Any]]:
+        rows = self._conn().execute(
+            "SELECT * FROM publishes WHERE task_id=? ORDER BY revision",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_other_tasks_using_path(self, file_path: str, task_id: int) -> int:
+        """旧卷串件检测：同一路径是否还被其他任务的发布登记引用。"""
+        row = self._conn().execute(
+            "SELECT COUNT(*) AS c FROM publishes WHERE file_path=? AND task_id<>?",
+            (file_path, task_id),
+        ).fetchone()
+        return int(row["c"])
+
+    def mark_publish_restored(self, publish_id: int, new_path: str) -> None:
+        """发布件已恢复（文件就位且符合原登记）：更新路径并置为可用。"""
+        self._conn().execute(
+            "UPDATE publishes SET file_path=?, available=1, unavailable_reason=NULL, "
+            "repaired_at=? WHERE id=?",
+            (new_path, utcnow(), publish_id),
+        )
+        self._conn().commit()
+
+    def mark_publish_unavailable(self, publish_id: int, reason: str) -> None:
+        """无法恢复：标为不可用（下载拒绝），保留登记供审计与后续重试。"""
+        self._conn().execute(
+            "UPDATE publishes SET available=0, unavailable_reason=? WHERE id=?",
+            (reason, publish_id),
+        )
+        self._conn().commit()
+
     # ---------- 视图组装 ----------
     def task_detail(self, task_id: int) -> dict[str, Any]:
         task = self.get_task(task_id)
@@ -360,6 +416,9 @@ def _publish_view(p: dict[str, Any]) -> dict[str, Any]:
         "sha256": p["sha256"],
         "size": p["size"],
         "published_at": p["published_at"],
+        "available": bool(p["available"]),
+        "unavailable_reason": p["unavailable_reason"],
+        "repaired_at": p["repaired_at"],
     }
 
 

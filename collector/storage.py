@@ -2,10 +2,15 @@
 
 DATA_DIR/
 ├── collector.db
-├── locks/<task_id>.lock        # 跨实例 fcntl 互斥
-├── parts/<task_id>/r<rev>.part # 未完成分片（按修订号隔离）
-├── tmp/...                     # 发布临时文件（原子 replace 前）
-└── published/...               # 已发布、可下载的一致原件
+├── locks/<task_id>.lock                    # 跨实例 fcntl 互斥
+├── parts/<task_id>/r<rev>.part             # 分片（按任务+修订号隔离；发布后不删，留作修复底本）
+├── tmp/...                                 # 发布临时文件（原子 replace 前）
+└── published/<task_id>/<站>_<日期>_r<rev>.csv  # 已发布、可下载的一致原件（按任务目录隔离）
+
+发布隔离说明：早期版本把发布件直接放在 published/ 顶层、文件名用 _safe() 清洗
+站号，导致 ST.01 与 ST_01 等不同站号映射到同一路径互相覆盖（串件）。现在发布
+路径一律带任务目录，跨任务永不冲突；旧数据卷中已登记的顶层旧路径不做迁移、
+不做删除，仍可按 publishes 表中的 file_path 原样下载（健康旧件保持可用）。
 """
 from __future__ import annotations
 
@@ -33,12 +38,16 @@ class Storage:
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, f"r{revision}.part")
 
-    def final_path(self, station: str, date: str, revision: int) -> str:
-        safe_station = _safe(station)
-        safe_date = _safe(date)
-        return os.path.join(
-            self.published_dir, f"{safe_station}_{safe_date}_r{revision}.csv"
-        )
+    def final_path(self, task_id: str, station: str, date: str, revision: int) -> str:
+        """发布件路径：任务目录隔离，任何两个任务的发布件不可能同路径。
+
+        站号仅做 _safe 清洗用于可读文件名（合法站号本身不受限制），
+        唯一性由 task_id 目录保证；旧卷顶层遗留文件不受新命名影响。
+        """
+        d = os.path.join(self.published_dir, str(task_id))
+        os.makedirs(d, exist_ok=True)
+        name = f"{_safe(station)}_{_safe(date)}_r{revision}.csv"
+        return os.path.join(d, name)
 
     def tmp_path(self, task_id: str, revision: int) -> str:
         return os.path.join(self.tmp_dir, f"{task_id}-r{revision}-{os.getpid()}.tmp")

@@ -7,12 +7,17 @@
    必须丢弃旧分片从头重新取得一致原件，绝不直接追加。
 4. ETag（强校验）与 206 响应前缀同时校验；换版/字节不一致立即中止并重取。
 5. 长度与 SHA-256 同时符合清单才允许发布；发布为原子操作并带防回退守卫。
+6. 发布件按任务目录隔离，任何两个任务的发布件不可能同路径（杜绝站号清洗串件）。
+7. 每轮继续在任何网络请求之前先修复本任务已登记发布件：旧卷串件/缺失时
+   仅用本地留存完整分片恢复（长度与 SHA-256 须符合原登记），源站离线也能修；
+   无法恢复的标为不可用并拒绝下载，绝不外发与登记摘要不符的内容。
 """
 from __future__ import annotations
 
 import contextlib
 import fcntl
 import hashlib
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Iterator
@@ -22,6 +27,8 @@ import httpx
 from . import db as schema
 from .config import Settings
 from .storage import Storage
+
+logger = logging.getLogger(__name__)
 
 
 class TransferError(Exception):
@@ -149,7 +156,7 @@ def _stream_to_part(
 
         # 响应正常结束（未在流中被截断）。完整到达时做严格校验。
         if written == expected_size:
-            if not _verify_full_file(part, expected_size, version["expected_sha256"]):
+            if not verify_file_integrity(part, expected_size, version["expected_sha256"]):
                 _truncate_part(part)
                 raise VerificationError("完整响应摘要与清单不符，分片作废")
         elif resp.status_code == 200:
@@ -167,9 +174,16 @@ def _parse_content_range_start(content_range: str) -> int:
         return -1
 
 
-def _verify_full_file(path: str, expected_size: int, expected_sha: str) -> bool:
-    """对落盘文件重新流式计算摘要（不信任传输中累加值，防崩溃/交错写入）。"""
-    if os.path.getsize(path) != expected_size:
+def verify_file_integrity(path: str, expected_size: int, expected_sha: str) -> bool:
+    """对落盘文件重新流式计算摘要（不信任传输中累加值，防崩溃/交错写入）。
+
+    长度与 SHA-256 必须同时符合登记值；下载接口与发布件修复也用同一判定，
+    保证“响应摘要与正文一致”这一承诺在传输、发布、修复、下载四处口径统一。
+    """
+    try:
+        if os.path.getsize(path) != expected_size:
+            return False
+    except OSError:
         return False
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -179,6 +193,70 @@ def _verify_full_file(path: str, expected_size: int, expected_sha: str) -> bool:
                 break
             digest.update(block)
     return digest.hexdigest() == expected_sha
+
+
+def repair_publishes(
+    database: schema.Database, storage: Storage, task_id: int
+) -> list[dict[str, Any]]:
+    """修复本任务已登记发布件（旧卷站号清洗串件 / 发布文件缺失）。
+
+    在任务锁内、任何网络请求之前调用：只依赖本地留存分片与磁盘文件，
+    源站离线也能完成恢复。动作列表随任务详情返回，便于审计。
+
+    判定与动作：
+    - 唯一路径 + 存在 + 长度符合 + 可用：信任登记，跳过（不每次全量哈希）。
+    - 可疑（路径被其他任务登记引用 / 缺失 / 长度不符 / 曾被标不可用）：
+      流式核对长度+SHA-256；健康则仅恢复可用标记，不搬动文件。
+    - 确认串件/缺失：用本任务留存的完整分片（长度与 SHA-256 须符合原登记）
+      原子发布到任务隔离的新路径，再更新登记；分片不符合则标为不可用。
+    全程只写本任务专属路径，不触碰其他任务的发布件，不回退已发布修订。
+    """
+    repairs: list[dict[str, Any]] = []
+    publishes = database.list_publishes(task_id)
+    if not publishes:
+        return repairs
+    task = database.get_task(task_id)
+    for pub in publishes:
+        path = pub["file_path"]
+        shared = database.count_other_tasks_using_path(path, task_id) > 0
+        exists = os.path.isfile(path)
+        size_ok = exists and os.path.getsize(path) == pub["size"]
+        if not shared and size_ok and pub["available"]:
+            continue  # 快速路径：无嫌疑，信任登记
+        if size_ok and verify_file_integrity(path, pub["size"], pub["sha256"]):
+            # 内容其实健康（含共享路径但未被覆盖）：仅恢复可用标记
+            if not pub["available"]:
+                database.mark_publish_restored(pub["id"], path)
+                repairs.append(
+                    {"revision": pub["revision"], "action": "marked_available",
+                     "file_path": path}
+                )
+            continue
+        # 串件/缺失：用本任务留存的完整分片恢复，长度与 SHA-256 须符合原登记
+        part = storage.part_path(str(task_id), pub["revision"])
+        if os.path.isfile(part) and verify_file_integrity(part, pub["size"], pub["sha256"]):
+            final = storage.final_path(
+                str(task_id), task["station"], task["date"], pub["revision"]
+            )
+            storage.publish_atomic(part, final)
+            database.mark_publish_restored(pub["id"], final)
+            logger.warning(
+                "task %s r%s: 发布件串件/缺失，已用留存分片恢复 -> %s",
+                task_id, pub["revision"], final,
+            )
+            repairs.append(
+                {"revision": pub["revision"], "action": "restored",
+                 "from_part": part, "file_path": final}
+            )
+        else:
+            reason = "发布文件缺失或与登记不符，且本任务无符合登记的完整分片可恢复"
+            if pub["available"] or pub["unavailable_reason"] != reason:
+                database.mark_publish_unavailable(pub["id"], reason)
+            logger.error("task %s r%s: %s", task_id, pub["revision"], reason)
+            repairs.append(
+                {"revision": pub["revision"], "action": "unavailable", "reason": reason}
+            )
+    return repairs
 
 
 def run_resume(
@@ -193,6 +271,9 @@ def run_resume(
     lock_path = storage.lock_path(str(task_id))
 
     with task_lock(lock_path):
+        # 先于任何网络请求：旧卷串件/缺失的发布件仅用本地留存分片修复，
+        # 源站离线也能恢复原发布件；无法恢复的标为不可用并拒绝下载。
+        repairs = repair_publishes(database, storage, task_id)
         database.mark_task_downloading(task_id, settings.instance_id)
         try:
             with httpx.Client(
@@ -204,7 +285,7 @@ def run_resume(
                 version = database.upsert_manifest(task_id, manifest, part)
 
                 if version["state"] == schema.REV_PUBLISHED:
-                    return database.task_detail(task_id)
+                    return _detail_with_repairs(database, task_id, repairs)
 
                 database.mark_version_downloading(version["id"], settings.instance_id)
                 try:
@@ -215,14 +296,14 @@ def run_resume(
 
                     if written == version["expected_size"]:
                         _publish(database, storage, version, settings.instance_id)
-                        return database.task_detail(task_id)
+                        return _detail_with_repairs(database, task_id, repairs)
 
                     # 未下满且连接正常结束：分片保留，任务回到 INTERRUPTED 待续
                     database.mark_version_interrupted(
                         version["id"], "链路中断，已保留分片待续传"
                     )
                     database.mark_task_interrupted(task_id, "分片不完整，等待继续")
-                    return database.task_detail(task_id)
+                    return _detail_with_repairs(database, task_id, repairs)
                 except VerificationError as exc:
                     database.mark_version_interrupted(version["id"], str(exc))
                     database.update_progress(version["id"], 0)
@@ -246,6 +327,14 @@ def run_resume(
             raise
 
 
+def _detail_with_repairs(
+    database: schema.Database, task_id: int, repairs: list[dict[str, Any]]
+) -> dict[str, Any]:
+    detail = database.task_detail(task_id)
+    detail["repairs"] = repairs
+    return detail
+
+
 def _publish(
     database: schema.Database,
     storage: Storage,
@@ -254,11 +343,14 @@ def _publish(
 ) -> None:
     part = version["part_path"]
     # 发布前最后一次独立校验：长度 + SHA-256 必须与清单完全一致
-    if not _verify_full_file(part, version["expected_size"], version["expected_sha256"]):
+    if not verify_file_integrity(part, version["expected_size"], version["expected_sha256"]):
         raise VerificationError("发布前终检失败：长度或 SHA-256 与清单不符")
 
     task = database.get_task(version["task_id"])
-    final = storage.final_path(task["station"], task["date"], version["revision"])
+    # 发布路径按任务目录隔离：不同任务的发布件永不复用同一路径（防站号清洗串件）
+    final = storage.final_path(
+        str(version["task_id"]), task["station"], task["date"], version["revision"]
+    )
     storage.publish_atomic(part, final)
 
     # 条件更新：已发布的同修订不会重复登记（崩溃重入/并发保护）

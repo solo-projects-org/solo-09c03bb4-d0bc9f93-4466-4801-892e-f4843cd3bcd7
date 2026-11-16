@@ -2,10 +2,13 @@
 
 API：
 - POST /tasks                 按站号、日期建任务（日包）
-- POST /tasks/{id}/resume     继续采集（断点续传；锁忙返回 409）
+- POST /tasks/{id}/resume     继续采集（断点续传；锁忙返回 409）。
+                              每轮先本地修复已登记发布件（旧卷串件/缺失），
+                              源站离线也能用留存分片恢复原发布件
 - GET  /tasks                 任务清单
-- GET  /tasks/{id}            进度详情（版本/分片/发布信息）
-- GET  /tasks/{id}/download   下载已发布原件（未发布返回 409，杜绝半件外发）
+- GET  /tasks/{id}            进度详情（版本/分片/发布信息，含发布可用性）
+- GET  /tasks/{id}/download   下载已发布原件（未发布/不可用/疑似串件返回 409，
+                              杜绝半件与串件外发）
 - GET  /health                健康检查，含实例 ID
 """
 from __future__ import annotations
@@ -26,6 +29,7 @@ from .transfer import (
     TransferError,
     VerificationError,
     run_resume,
+    verify_file_integrity,
 )
 
 app = FastAPI(
@@ -121,15 +125,49 @@ def download(task_id: int) -> FileResponse:
         raise HTTPException(status_code=404, detail="任务不存在")
 
     publish = database.latest_published(task_id)
-    if publish is None or not os.path.isfile(publish["file_path"]):
+    if publish is None:
         raise HTTPException(
             status_code=409,
             detail="原件尚未发布（长度与 SHA-256 校验未通过），拒绝下载半件",
         )
+    if not publish["available"]:
+        # 已确认串件/缺失且无可恢复分片：拒绝下载，等待 resume 重试修复
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "原件已标记不可用：发布文件与登记不符且无可恢复分片",
+                "reason": publish["unavailable_reason"],
+                "retry": f"POST /tasks/{task_id}/resume 可触发修复重试",
+            },
+        )
 
-    filename = os.path.basename(publish["file_path"])
+    path = publish["file_path"]
+    retry_hint = {"retry": f"POST /tasks/{task_id}/resume 触发本地修复"}
+    if not os.path.isfile(path):
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "发布文件缺失，等待修复", **retry_hint},
+        )
+    if os.path.getsize(path) != publish["size"]:
+        # 长度与登记不符（疑似旧卷串件）：拒绝外发，正文必须与响应摘要一致
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "发布文件长度与登记不符（疑似串件），拒绝外发", **retry_hint},
+        )
+    if database.count_other_tasks_using_path(path, task_id) > 0:
+        # 旧卷共享路径（站号清洗撞名）：必须流式核对内容，防止把别站原件发出去
+        if not verify_file_integrity(path, publish["size"], publish["sha256"]):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "发布文件与登记摘要不符（旧卷共享路径串件），拒绝外发",
+                    **retry_hint,
+                },
+            )
+
+    filename = os.path.basename(path)
     return FileResponse(
-        publish["file_path"],
+        path,
         media_type="text/csv",
         filename=filename,
         headers={
